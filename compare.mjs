@@ -19,7 +19,7 @@ for (let i = 0; i < cases.length; i++) {
   if (got === exp) pass++;
   else fails.push({ id: c.id, i, got, exp, md: c.markdown });
 }
-console.log('passed', pass, '/', cases.length, 'fails', fails.length);
+console.log('passed', pass, '/', cases.length, '| mismatches:', fails.length);
 for (const f of fails.slice(0, 8)) {
   console.log('---', f.id);
   console.log('MD :', JSON.stringify(f.md.slice(0, 400)));

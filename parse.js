@@ -410,7 +410,9 @@ function parseBlocks(lines, defs, endNl, inItem) {
           while (k < L.length && L.charCodeAt(k) === f.char) { flen++; k++; }
           if (flen >= f.len && L.slice(k).trim() === '') { j++; break; }
         }
-        buf.push(stripSpacesMax(L, f.indent));
+        let strip = 0;
+        if (f.char === 96) while (strip < f.indent && (L.charCodeAt(strip) === 32 || L.charCodeAt(strip) === 9)) strip++;
+        buf.push(L.slice(strip));
         j++;
       }
       // marked: a fence keeps at most (trailingBlanks - 1) blank lines
@@ -535,7 +537,15 @@ function parseBlocks(lines, defs, endNl, inItem) {
       // block with a single newline; absent when a blank line follows or at
       // EOF without a final newline
       let text = buf.join('\n');
-      if (j < n && !isBlank(lines[j])) text += '\n';
+      if (h.kind === 'raw') {
+        // raw blocks (comments/PI/decl) end on their closing marker; the
+        // newline that follows survives unless a real empty line is next
+        if (j < n) {
+          if (lines[j].length !== 0) text += '\n';
+        } else if (endNl || (n > 0 && lines[n - 1].length > 0 && isBlank(lines[n - 1]))) {
+          text += '\n';
+        }
+      } else if (j < n && !isBlank(lines[j])) text += '\n';
       else if (j >= n && endNl) text += '\n';
       tokens.push({ type: 'html', text });
       i = j;
@@ -598,12 +608,19 @@ function parseBlocks(lines, defs, endNl, inItem) {
           const rows = [];
           let j = i + 2;
           const isRowLine = (s) => {
-            if (isBlank(s)) return false;
-            const w = indentWidth(s);
-            if (w >= 4) return false;
-            if (s.charCodeAt(w) === 62 || s.charCodeAt(w) === 35) return false;
-            if (matchFence(s) || isThematicBreak(s) || matchListMarker(s) || matchAtx(s)) return false;
-            if (startsHtmlBlock6(s)) return false;
+            // a row needs a non-space character after any leading spaces; a
+            // spaces-only line therefore ends the table (a tab does not count
+            // as a leading space, so a tab-only line is still a row)
+            let k = 0;
+            const len = s.length;
+            while (k < len && s.charCodeAt(k) === 32) k++;
+            if (k >= len) return false;
+            if (k < 4) {
+              const c = s.charCodeAt(k);
+              if (c === 62 || c === 35) return false;
+              if (matchFence(s) || isThematicBreak(s) || matchListMarker(s) || matchAtx(s)) return false;
+              if (startsHtmlBlock6(s)) return false;
+            }
             return true;
           };
           while (j < n && isRowLine(lines[j])) {
@@ -713,7 +730,7 @@ function parseList(lines, start, first) {
     // stack of nested list domains inside this item: {markerCol, contentCol}
     const domains = [];
     let itemLoose = false;
-    let fenceOpen = false, fenceMark = 0, fenceLen = 0;
+    let fenceOpen = false, fenceMark = 0, fenceLen = 0, fenceBody = false;
     {
       const ff = matchFence(firstContent);
       if (ff) { fenceOpen = true; fenceMark = ff.char; fenceLen = ff.len; paraActive = false; }
@@ -721,9 +738,14 @@ function parseList(lines, start, first) {
     while (k < n) {
       const L = lines[k];
       if (fenceOpen) {
-        // inside a fenced code block: every line is verbatim item content
-        if (isBlank(L)) { itemLines.push(''); k++; continue; }
+        // inside a fenced code block: every sufficiently indented line is
+        // verbatim item content; a line that falls out of the item's content
+        // column ends the item (the fence is left unterminated)
+        if (isBlank(L)) { itemLines.push(''); fenceBody = false; k++; continue; }
         const w = indentWidth(L);
+        // Lazy fence content requires a preceding indented body line.
+        if (w < ci && (!fenceBody || interruptsParagraph(L, true) || matchListMarker(L))) break;
+        fenceBody = true;
         const ded = w >= ci ? stripIndent(L, ci) : L;
         itemLines.push(ded);
         const cf = matchFence(ded);
@@ -751,6 +773,9 @@ function parseList(lines, start, first) {
         for (let d = domains.length - 1; d >= 0; d--) {
           if (w2 >= domains[d].contentCol) { inDomain = true; break; }
           if (mk2 && ci + mk2.indent >= domains[d].markerCol) { inDomain = true; break; }
+          // a lazy paragraph continuation cannot be outdented out of the
+          // nested item's domain: it still belongs to that item
+          if (!mk2 && w2 > domains[d].markerCol && !interruptsParagraph(L2)) { inDomain = true; break; }
         }
         if (!inDomain) itemLoose = true;
         for (let b = 0; b < bcount + 1; b++) itemLines.push('');
@@ -769,9 +794,12 @@ function parseList(lines, start, first) {
           if (mkHere) {
             if (ci + mkHere.indent >= d.markerCol) break;
           } else if (w >= d.contentCol) break;
+          else if (paraActive && w >= d.markerCol && !interruptsParagraph(L)) break;
+          else if (!mkHere && w > d.markerCol && !interruptsParagraph(L) &&
+                   !matchAtx(L) && !isThematicBreak(L) && !startsHtmlBlock6(L)) break;
           domains.pop();
         }
-        const cols = (paraActive && w - ci >= 4) ? ci + 4 : ci;
+        const cols = (paraActive && w - ci >= 4 && !/^[ ]*\t/.test(L)) ? ci + 4 : ci;
         const ded = stripIndent(L, cols);
         itemLines.push(ded);
         const dmk = matchListMarker(ded);
@@ -784,7 +812,7 @@ function parseList(lines, start, first) {
           }
         }
         const f = matchFence(ded);
-        if (f) { fenceOpen = true; fenceMark = f.char; fenceLen = f.len; paraActive = false; }
+        if (f) { fenceOpen = true; fenceBody = false; fenceMark = f.char; fenceLen = f.len; paraActive = false; }
         else paraActive = !(indentWidth(ded) >= 4 || matchAtx(ded) ||
           isThematicBreak(ded) || startsHtmlBlock6(ded) || ded.charCodeAt(0) === 62 || dmk);
         k++;
@@ -1038,8 +1066,14 @@ function scanInline(src, state) {
   let i = 0;
   let textStart = 0;
   let openCount = 0;
+  let maskedUntil = state.maskedUntil || 0;
   const pushText = (end) => {
-    if (end > textStart) toks.push({ t: 'text', s: src.slice(textStart, end) });
+    if (end > textStart) {
+      const s = src.slice(textStart, end);
+      const t = state.inLink ? { t: 'text', s, inLink: true } : { t: 'text', s };
+      if (maskedUntil > textStart) t.maskedUntil = maskedUntil - textStart;
+      toks.push(t);
+    }
   };
   while (i < n) {
     const c = src.charCodeAt(i);
@@ -1149,6 +1183,7 @@ function scanInline(src, state) {
       continue;
     }
     if (c === 42 || c === 95 || c === 126) {
+      if (i < maskedUntil && c !== 126) { i++; continue; }
       let j = i;
       while (j < n && src.charCodeAt(j) === c) j++;
       const before = i > 0 ? src.charCodeAt(i - 1) : 10;
@@ -1183,8 +1218,37 @@ function scanInline(src, state) {
       continue;
     }
     if (c === 91) {
+      // Recognize label boundaries before code spans can consume their tail.
+      const label = /^\[((?:\\.|`+[^`]+`+|`{2,}(?=\])|[^\[\]`\\]|\[(?:\\.|[^\]\\])*\])*)\]/.exec(src.slice(i));
+      if (!label) {
+        const close = src.indexOf(']', i + 1);
+        if (close >= 0 && (src[close + 1] === '(' || src[close + 1] === '[')) maskedUntil = Math.max(maskedUntil, close);
+      }
+      if (label && (label[1].includes('`') || maskedUntil > i) && (src[i + label[0].length] === '(' || src[i + label[0].length] === '[')) {
+        // The emphasis mask is computed on the original source, before a
+        // link limits the code scanner to its label.
+        const ticks = /`+/g;
+        ticks.lastIndex = i + 1;
+        let run;
+        while ((run = ticks.exec(src)) && run.index < i + label[0].length) {
+          const afterRun = ticks.lastIndex;
+          let end;
+          while ((end = ticks.exec(src))) {
+            if (end[0].length === run[0].length) {
+              if (end.index >= i + label[0].length) maskedUntil = Math.max(maskedUntil, ticks.lastIndex);
+              break;
+            }
+          }
+          if (!end) ticks.lastIndex = afterRun;
+        }
+        pushText(i);
+        toks.push({ t: 'linkOpen', img: false }, ...scanInline(label[1], { inLink: state.inLink }), { t: 'close' });
+        i += label[0].length;
+        textStart = i;
+        continue;
+      }
       pushText(i);
-      toks.push({ t: 'linkOpen', img: false });
+      toks.push({ t: 'linkOpen', img: false, invalidLabel: !label });
       openCount++;
       i++;
       textStart = i;
@@ -1391,9 +1455,9 @@ function gfmStartOk(src, i, openCount, state) {
 // that itself has a '(' dest (i.e. a nested link/image)? Such outer links
 // always fail in marked, leaving '](url)' to be linkified.
 function nestedLinkInLabel(src, i) {
-  // walk back from the '(' at i-1 to find the matching '['
+  // walk back from just before the ']' (at i-2) to find its matching '['
   let depth = 0;
-  let k = i - 2;
+  let k = i - 3;
   while (k >= 0) {
     const c = src[k];
     if (c === ']') depth++;
@@ -1505,14 +1569,31 @@ function matchGfmScheme(src, i, state) {
   return { text, href: text, email: false, end: i + text.length };
 }
 
+// Does the ']' at src[p] close a bracket that actually forms an inline link
+// in marked? Only then does it terminate a GFM url scan.
+function closesRealLink(src, p) {
+  const nx = src.charCodeAt(p + 1);
+  // reference form: ']' directly followed by '[' (full/collapsed ref)
+  if (nx === 91) return true;
+  if (nx !== 40) return false;                          // needs '(' right after
+  if (!parseInlineDest(src.slice(p + 1))) return false; // valid inline dest
+  if (nestedLinkInLabel(src, p + 1)) return false;      // label has a link
+  return true;
+}
+
+const BP_RE = /^(?:[^?!.,:;*_'"~()&]+|\([^)]*\)|&(?![a-zA-Z0-9]+;$)|[?!.,:;*_'"~)]+(?!$))+/;
+
 function scanGfmUrl(src, i, prefix, openCount) {
   const n = src.length;
   let end = i;
   while (end < n) {
     const c = src.charCodeAt(end);
     if (c <= 32 || c === 60 || c === 62) break;
-    // inside bracket context, a ']' would close the bracket: never swallow it
-    if (c === 93 && openCount > 0) break;
+    // In bracket context a ']' normally ends the url (the bracket closes a
+    // link). But when that bracket cannot form a link (nested link inside its
+    // label, or no valid inline dest) marked keeps ']' as ordinary url text
+    // and percent-encodes it.
+    if (c === 93 && openCount > 0 && closesRealLink(src, end)) break;
     end++;
   }
   let text = src.slice(i, end);
@@ -1529,32 +1610,14 @@ function scanGfmUrl(src, i, prefix, openCount) {
       }
     }
   }
-  while (text.length > 0) {
-    const last = text.charCodeAt(text.length - 1);
-    if (last === 59) {
-      const em = /&(#?[0-9a-zA-Z]+);$/.exec(text);
-      if (em) { text = text.slice(0, text.length - em[0].length); continue; }
-      text = text.slice(0, -1);
-      continue;
-    }
-    if (last === 63 || last === 33 || last === 46 || last === 44 || last === 58 || last === 42 ||
-        last === 95 || last === 126 || last === 39 || last === 34) {
-      text = text.slice(0, -1);
-      continue;
-    }
-    if (last === 41) {
-      let op = 0;
-      for (let q = 0; q < text.length; q++) {
-        if (text.charCodeAt(q) === 40) op++;
-        else if (text.charCodeAt(q) === 41) op--;
-      }
-      if (op < 0) { text = text.slice(0, -1); continue; }
-    }
-    if (last === 59) {
-      const em = /&(#?[0-9a-zA-Z]+);$/.exec(text);
-      if (em) { text = text.slice(0, text.length - em[0].length); continue; }
-    }
-    break;
+  // marked trims a GFM url tail by repeatedly applying its "backpedal"
+  // regex to the matched prefix until it stops shrinking. A trailing ')'
+  // survives only when it closes a '(' group that is itself the tail.
+  for (;;) {
+    const m = BP_RE.exec(text);
+    const next = m ? m[0] : '';
+    if (next === text) break;
+    text = next;
   }
   if (text.length <= (prefix ? 4 : 0)) return null;
   return { text, href: prefix + text, email: false, end: i + text.length };
@@ -1605,6 +1668,7 @@ function matchGfmEmail(src, i, state) {
 
 // Returns {dest,title,consumed} with consumed = tokens used after closeIdx, or null.
 function tryResolveLink(toks, openIdx, closeIdx, refs) {
+  if (toks[openIdx].invalidLabel) return null;
   const n = toks.length;
   let i = closeIdx + 1;
   // gather source text of following t/raw/delim/soft tokens
@@ -1616,6 +1680,7 @@ function tryResolveLink(toks, openIdx, closeIdx, refs) {
     else if (t.t === 'soft' || t.t === 'br') src += '\n';
     else if (t.t === 'delim') src += t.ch.repeat(t.len);
     else if (t.t === 'gfm') src += t.text;
+    else if (t.t === 'autolink') src += '<' + t.s + '>';
     else break;
     lastIdx = k;
     if (src.length > 4096) break;
@@ -1627,9 +1692,22 @@ function tryResolveLink(toks, openIdx, closeIdx, refs) {
       const used = r.consumed;
       let k = i;
       let acc = 0;
+      // A trailing '\' swallowed into the consumed text still escapes the
+      // line break that follows, so the next soft break becomes <br>.
+      const fixTailEscape = (j) => {
+        const last = toks[j];
+        if (!last || last.t !== 'text' || last.esc || last.s === undefined) return;
+        let b = 0;
+        for (let q = last.s.length - 1; q >= 0 && last.s.charCodeAt(q) === 92; q--) b++;
+        if (b === 0 || b % 2 === 0) return;
+        const nx = toks[j + 1];
+        if (!nx || nx.t !== 'soft') return;
+        last.s = last.s.slice(0, -1);
+        nx.t = 'br';
+      };
       while (k <= lastIdx && acc < used) {
         const t = toks[k];
-        const tl = t.t === 'soft' || t.t === 'br' ? 1 : (t.t === 'delim' ? t.len : (t.t === 'gfm' ? t.text.length : (t.esc ? 2 : (t.s ? t.s.length : 0))));
+        const tl = t.t === 'soft' || t.t === 'br' ? 1 : (t.t === 'delim' ? t.len : (t.t === 'gfm' ? t.text.length : (t.t === 'autolink' ? t.s.length + 2 : (t.esc ? 2 : (t.s ? t.s.length : 0)))));
         if (acc + tl > used && t.t === 'delim') {
           const take = used - acc;
           const rest = t.len - take;
@@ -1643,15 +1721,28 @@ function tryResolveLink(toks, openIdx, closeIdx, refs) {
           if (t.t === 'gfm') {
             const pre = t.href.length - t.text.length;
             const head = { t: 'gfm', text: t.text.slice(0, take), href: t.href.slice(0, pre + take), email: t.email };
-            t.text = t.text.slice(take);
-            t.href = t.href.slice(pre + take);
-            toks.splice(k + 1, 0, t);
+            // The residue is only a link if it still starts a URL on its own
+            // (marked re-tokenizes after the link is consumed).
+            const rest = t.text.slice(take);
+            const sub = scanInline(rest, { inLink: !!t.inLink, maskedUntil: Math.max(0, (t.maskedUntil || 0) - take) });
+            const only = sub.length === 1 && sub[0].t === 'text' ? sub[0] : null;
+            toks.splice(k + 1, 0, ...(only ? [only] : sub));
             toks[k] = head;
+            fixTailEscape(k + 1);
           } else {
             const rest = t.s.slice(take);
             t.s = t.s.slice(0, take);
             if (t.t === 'html') t.t = 'text';
-            toks.splice(k + 1, 0, { t: 'text', s: rest });
+            if (rest) {
+              // marked re-lexes the leftover text from a fresh start, so a URL
+              // that begins right there does get linkified (but autolink
+              // suppression inside an <a> still applies).
+              const sub = scanInline(rest, { inLink: !!t.inLink, maskedUntil: Math.max(0, (t.maskedUntil || 0) - take) });
+              toks.splice(k + 1, 0, ...sub);
+              fixTailEscape(k + 1);
+            } else {
+              toks.splice(k + 1, 0, { t: 'text', s: rest });
+            }
           }
           return { dest: r.dest, title: r.title, consumedTok: k + 1 };
         }
@@ -1905,7 +1996,7 @@ function processEmphasis(toks) {
           // holds a formed em (doc-11: two* inside; cm-443: foo* outside)
           if (t.hostNode) {
             const hi = toks.indexOf(t);
-            if (hi >= 0 && regionHasEm(t.hostNode.children)) {
+            if (hi >= 0 && t.hostNode.t === 'strong' && regionHasEm(t.hostNode.children)) {
               toks.splice(hi, 1);
               t.hostNode.children.push(t);
               i = hi - 1 < 0 ? 0 : hi - 1;

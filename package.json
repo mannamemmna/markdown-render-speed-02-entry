@@ -1,0 +1,9 @@
+{
+  "name": "markdown-render-speed-02-entry",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=22.23.4" },
+  "scripts": { "start": "node main.ts", "compare": "node compare.mjs" }
+}
